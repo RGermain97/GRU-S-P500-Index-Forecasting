@@ -1,0 +1,165 @@
+!pip install yfinance numpy pandas scikit-learn tensorflow matplotlib
+
+
+import yfinance as yf
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense
+from tensorflow.keras.regularizers import l2
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from datetime import timedelta
+
+# Download 1-day data from yfinance for LTC-USD and VIX
+stock_symbol = '^SPX'
+vix_symbol = '^VIX'
+start_date = '1993-10-01'
+end_date = '2025-03-22'
+interval = '1d'
+
+litecoin_data = yf.download(stock_symbol, start=start_date, end=end_date, interval=interval)
+vix_data = yf.download(vix_symbol, start=start_date, end=end_date, interval=interval)
+
+# Reset the index
+litecoin_data.reset_index(inplace=True)
+vix_data.reset_index(inplace=True)
+
+# Make sure the indexes match; this step is crucial because the VIX might have different trading hours
+litecoin_data['Date'] = pd.to_datetime(litecoin_data['Date'])
+vix_data['Date'] = pd.to_datetime(vix_data['Date'])
+print(litecoin_data)
+
+# Calculate the Z-Score for the 'Close' price
+litecoin_data['Close_ZScore'] = (litecoin_data['Close'] - litecoin_data['Close'].mean()) / litecoin_data['Close'].std()
+vix_data['Closevix_ZScore'] = (vix_data['Close'] - vix_data['Close'].mean()) / vix_data['Close'].std()
+
+merged_data = pd.merge_asof(litecoin_data.sort_values('Date'), vix_data.sort_values('Date'), on='Date', suffixes=('', '_vix'), direction='nearest')
+
+# Preprocess data
+# Adjust features to include only necessary columns for predicting the current day's close
+features_data = merged_data[['Open', 'High', 'Low', 'Volume', 'Close_vix', 'Open_vix', 'High_vix', 'Low_vix']]
+target_data = merged_data[['Close']]
+
+# Shift the features to use previous day's data to predict the next day's close
+features_data = features_data.shift(1).iloc[1:]  # Shift and drop the first row due to NaN
+target_data = target_data.iloc[1:]  # Drop the first row to align with features
+
+# Split data into train and test before scaling to prevent data leakage
+train_size = int(len(features_data) * 0.9)
+features_train = features_data[:train_size]
+features_test = features_data[train_size:]
+target_train = target_data[:train_size]
+target_test = target_data[train_size:]
+
+# Fit the scaler on the training data only
+scaler_features = MinMaxScaler(feature_range=(0, 1)).fit(features_train)
+scaler_target = MinMaxScaler(feature_range=(0, 1)).fit(target_train)
+
+# Transform both training and test data
+scaled_features_train = scaler_features.transform(features_train)
+scaled_features_test = scaler_features.transform(features_test)
+scaled_target_train = scaler_target.transform(target_train)
+scaled_target_test = scaler_target.transform(target_test)
+
+# Use scaled training data to create dataset for model training
+def create_dataset(features, targets, lookback):
+    dataX, dataY = [], []
+    for i in range(len(features) - lookback):
+        a = features[i:(i + lookback), :]
+        dataX.append(a)
+        dataY.append(targets[i, 0])
+    return np.array(dataX), np.array(dataY)
+
+lookback = 3
+X_train, y_train = create_dataset(scaled_features_train, scaled_target_train, lookback)
+X_test, y_test = create_dataset(scaled_features_test, scaled_target_test, lookback)
+
+# Rescaling the test targets for performance evaluation
+y_test_rescaled = scaler_target.inverse_transform(y_test.reshape(-1, 1))
+
+# Preparing the last sequence from the test set for the next day prediction
+last_sequence_test = scaled_features_test[-lookback:]
+last_sequence_test = last_sequence_test.reshape((1, lookback, features_test.shape[1]))
+
+# Model creation using GRU
+def create_gru_model(input_shape):
+    model = Sequential()
+    model.add(GRU(units=1500, return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(0.00)))
+    model.add(GRU(units=1500, kernel_regularizer=l2(0.000)))
+    model.add(Dense(units=750, kernel_regularizer=l2(0.0000)))
+    model.add(Dense(units=1))
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
+
+input_shape = (X_train.shape[1], X_train.shape[2])
+model = create_gru_model(input_shape)
+
+# Initialize lists to store all predictions for test set and next day
+all_test_predictions = []
+all_next_day_predictions = []
+
+for i in range(5):
+    # Recreate and recompile the model to reset it
+    model = create_gru_model(input_shape)
+
+    # Train the model
+    history = model.fit(X_train, y_train, epochs=40, batch_size=64, validation_split=0.1, verbose=1)
+
+    # Plot training and validation losses for each iteration
+    plt.figure(figsize=(10, 6))
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title(f'Train and Validation Losses (Iteration {i+1})')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+
+    # Generate and store predictions for the test set
+    y_pred = model.predict(X_test)
+    all_test_predictions.append(y_pred)
+
+    # Generate and store predictions for the next day
+    next_day_prediction = model.predict(last_sequence_test)
+    all_next_day_predictions.append(next_day_prediction)
+
+# Average predictions across all iterations for test set
+avg_test_predictions = np.mean(all_test_predictions, axis=0)
+avg_test_pred_rescaled = scaler_target.inverse_transform(avg_test_predictions)
+
+# Average predictions across all iterations for the next day
+avg_next_day_predictions = np.mean(all_next_day_predictions, axis=0)
+avg_next_day_pred_rescaled = scaler_target.inverse_transform(avg_next_day_predictions)
+
+# Calculate accuracy metrics for averaged predictions
+avg_mse = mean_squared_error(y_test_rescaled, avg_test_pred_rescaled)
+avg_rmse = np.sqrt(avg_mse)  # Root Mean Squared Error
+avg_mae = mean_absolute_error(y_test_rescaled, avg_test_pred_rescaled)
+avg_r2 = r2_score(y_test_rescaled, avg_test_pred_rescaled)
+
+# Plot actual vs average predicted prices
+plt.figure(figsize=(60, 28))
+plt.plot(y_test_rescaled, label='Actual Price', color='blue', linewidth=2, linestyle='-')
+plt.plot(avg_test_pred_rescaled, label='Average Predicted Price', color='green', linewidth=2, linestyle='-')
+plt.title('Actual vs Average Predicted Prices for the Test Set')
+plt.xlabel('Time (in days)')
+plt.ylabel('Price')
+plt.legend()
+plt.show()
+
+
+# Assuming litecoin_data['Date'] is your primary date column and it's in chronological order
+last_date_in_dataset = litecoin_data['Date'].iloc[-1]  # Last date in the entire dataset
+predicted_date = last_date_in_dataset + timedelta(days=1)  # Next day after the last date
+
+# Now you can use predicted_date safely
+print("Average predicted closing price for", predicted_date.strftime('%Y-%m-%d'), ":", avg_next_day_pred_rescaled[0][0])
+
+# Display the accuracy metrics
+#print(f"Maximum Absolute Error: {max_absolute_error}")
+print(f"Mean Squared Error (MSE): {avg_mse}")
+print(f"Root Mean Squared Error (RMSE): {avg_rmse}")
+print(f"Mean Absolute Error (MAE): {avg_mae}")
+print(f"Coefficient of Determination (R² score): {avg_r2}")
